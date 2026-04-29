@@ -255,6 +255,7 @@ public class Servidor {
     // ─── AUXILIARES ───────────────────────────────────────────────────────────
 
     private String autenticar(JSONObject dados, PrintWriter saida) {
+        // Passo 1 — campo presente e não vazio
         if (!dados.has("token")) {
             enviarErro(saida, "Campo obrigatório ausente: 'token'.");
             return null;
@@ -267,6 +268,36 @@ public class Servidor {
             return null;
         }
 
+        // Passo 2 — token "adm" é fixo e não representa sessão de usuário comum
+        if (token.equals("adm")) {
+            enviarErro(saida, "Token inválido.");
+            return null;
+        }
+
+        // Passo 3 e 4 — dividir pelo separador e exigir exatamente 2 partes
+        String[] partes = token.split("_");
+        if (partes.length != 2) {
+            enviarErro(saida, "Token inválido.");
+            return null;
+        }
+
+        // Passo 5 — extrair role e nome
+        String role        = partes[0];
+        String nomeUsuario = partes[1];
+
+        // Passo 6 — validar nome: alfanumérico, entre 5 e 20 caracteres
+        if (!nomeUsuario.matches("[a-zA-Z0-9]{5,20}")) {
+            enviarErro(saida, "Token inválido.");
+            return null;
+        }
+
+        // Passo 7 — validar role
+        if (!role.equals("usr")) {
+            enviarErro(saida, "Token inválido.");
+            return null;
+        }
+
+        // Parse concluído — verifica se há sessão ativa para esse token
         String usuario = sessoes.get(token);
         if (usuario == null) {
             enviarErro(saida, "Token inválido.");
@@ -292,6 +323,6 @@ public class Servidor {
     }
 
     public static void main(String[] args) {
-        new Servidor(8080).iniciar();
+        new Servidor(21111).iniciar();
     }
 }

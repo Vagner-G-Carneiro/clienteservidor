@@ -281,10 +281,10 @@ public class Cliente {
     public static void main(String[] args) {
         Scanner scanner = new Scanner(System.in);
 
-        System.out.print("[SETUP] IP do servidor (ex: 127.0.0.1 ou IP Radmin): ");
+        System.out.print("[SETUP] IP do servidor (ex: 10.20.40.51): ");
         String ip = scanner.nextLine().trim();
 
-        System.out.print("[SETUP] Porta do servidor (ex: 8080): ");
+        System.out.print("[SETUP] Porta do servidor (ex: 21000): ");
         int porta = scanner.nextInt();
         scanner.nextLine();
 
