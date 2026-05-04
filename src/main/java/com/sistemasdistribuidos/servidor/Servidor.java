@@ -37,8 +37,8 @@ public class Servidor {
 
     private void lidarComCliente(Socket socket) {
         try (BufferedReader entrada = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-             PrintWriter saida = new PrintWriter(socket.getOutputStream(), true)) {
-
+            PrintWriter saida = new PrintWriter(socket.getOutputStream(), true)) {
+            System.out.println("[SISTEMA] Cliente conectado: " + socket.getInetAddress() + ":" + socket.getPort());
             String linha;
             while ((linha = entrada.readLine()) != null) {
                 try {
