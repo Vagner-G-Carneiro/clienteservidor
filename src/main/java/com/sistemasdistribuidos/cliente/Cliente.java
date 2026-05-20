@@ -1,5 +1,6 @@
 package com.sistemasdistribuidos.cliente;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
@@ -41,6 +42,7 @@ public class Cliente {
                     case "4": consultarUsuario(saida, entrada);             break;
                     case "5": atualizarUsuario(scanner, saida, entrada);    break;
                     case "6": deletarUsuario(scanner, saida, entrada);      break;
+                    case "9": areaAdministrativa(scanner, saida, entrada);  break;
                     default:  System.err.println("Opção inválida! Digite o número correspondente ao menu.");
                 }
             }
@@ -62,6 +64,7 @@ public class Cliente {
             System.out.println("| 6 - Deletar Conta     |");
             System.out.println("| Sessão: " + tokenAtual + " |");
         }
+        System.out.println("| 9 - Área Administrativa |");
         System.out.println("------------------------");
         System.out.print("Escolha uma opção: ");
     }
@@ -225,6 +228,132 @@ public class Cliente {
         if (resp != null && "200".equals(resp.optString("resposta"))) {
             tokenAtual = null;
         }
+    }
+
+    // ═══ ENTREGA 2 — ÁREA ADMINISTRATIVA ════════════════════════════════════════
+    // O token de administrador é digitado MANUALMENTE pelo cliente e enviado ao
+    // servidor. Isso permite consumir servidores de terceiros (cada um com seu token).
+
+    private void areaAdministrativa(Scanner scanner, PrintWriter saida, BufferedReader entrada) throws IOException {
+        System.out.println("\n--- ÁREA ADMINISTRATIVA ---");
+        System.out.print("Token de administrador: ");
+        String tokenAdmin = scanner.nextLine().trim();
+
+        while (true) {
+            System.out.println("\n---=== Menu Admin ===---");
+            System.out.println("| 1 - Listar todos usuários |");
+            System.out.println("| 2 - Consultar usuário     |");
+            System.out.println("| 3 - Atualizar usuário     |");
+            System.out.println("| 4 - Deletar usuário       |");
+            System.out.println("| 0 - Voltar                |");
+            System.out.print("Escolha uma opção: ");
+            String opcao = scanner.nextLine().trim();
+
+            switch (opcao) {
+                case "1": consultarUsuariosAdmin(tokenAdmin, saida, entrada);          break;
+                case "2": consultarUsuarioAdmin(scanner, tokenAdmin, saida, entrada);  break;
+                case "3": atualizarUsuarioAdmin(scanner, tokenAdmin, saida, entrada);  break;
+                case "4": deletarUsuarioAdmin(scanner, tokenAdmin, saida, entrada);    break;
+                case "0": return;
+                default:  System.err.println("Opção inválida!");
+            }
+        }
+    }
+
+    // ─── ADM LIST ───────────────────────────────────────────────────────────────
+
+    private void consultarUsuariosAdmin(String tokenAdmin, PrintWriter saida, BufferedReader entrada) throws IOException {
+        System.out.println("\n--- LISTAR TODOS USUÁRIOS (ADM) ---");
+
+        JSONObject req = new JSONObject();
+        req.put("op",          "consultarUsuariosAdmin");
+        req.put("token_admin", tokenAdmin);
+
+        enviarRequisicao(saida, req);
+        JSONObject resp = receberResposta(entrada);
+
+        if (resp != null && "200".equals(resp.optString("resposta"))) {
+            JSONArray lista = resp.optJSONArray("lista_usuarios");
+            if (lista == null || lista.isEmpty()) {
+                System.out.println("[DADOS] Nenhum usuário cadastrado.");
+            } else {
+                System.out.println("[DADOS] " + lista.length() + " usuário(s):");
+                for (int i = 0; i < lista.length(); i++) {
+                    JSONObject u = lista.getJSONObject(i);
+                    System.out.println("   - " + u.optString("usuario") + " (" + u.optString("nome") + ")");
+                }
+            }
+        }
+    }
+
+    // ─── ADM READ ─────────────────────────────────────────────────────────────
+
+    private void consultarUsuarioAdmin(Scanner scanner, String tokenAdmin, PrintWriter saida, BufferedReader entrada) throws IOException {
+        System.out.println("\n--- CONSULTAR USUÁRIO (ADM) ---");
+        System.out.print("Usuário a consultar: ");
+        String usuario = scanner.nextLine().trim();
+
+        JSONObject req = new JSONObject();
+        req.put("op",          "consultarUsuarioAdmin");
+        req.put("token_admin", tokenAdmin);
+        req.put("usuario",     usuario);
+
+        enviarRequisicao(saida, req);
+        JSONObject resp = receberResposta(entrada);
+
+        if (resp != null && "200".equals(resp.optString("resposta"))) {
+            System.out.println("[DADOS] Nome:    " + resp.optString("nome"));
+            System.out.println("[DADOS] Usuário: " + resp.optString("usuario"));
+        }
+    }
+
+    // ─── ADM UPDATE ─────────────────────────────────────────────────────────────
+
+    private void atualizarUsuarioAdmin(Scanner scanner, String tokenAdmin, PrintWriter saida, BufferedReader entrada) throws IOException {
+        System.out.println("\n--- ATUALIZAR USUÁRIO (ADM) ---");
+        System.out.print("Usuário a atualizar: ");
+        String usuario = scanner.nextLine().trim();
+
+        System.out.println("(Deixe em branco o campo que NÃO quer alterar)");
+        System.out.print("Novo nome: ");
+        String nome = scanner.nextLine().trim();
+
+        System.out.print("Nova senha: ");
+        String senha = scanner.nextLine().trim();
+
+        JSONObject req = new JSONObject();
+        req.put("op",          "atualizarUsuarioAdmin");
+        req.put("token_admin", tokenAdmin);
+        req.put("usuario",     usuario);
+        // Campo em branco é enviado como nulo, conforme o protocolo.
+        req.put("nome",  nome.isEmpty()  ? JSONObject.NULL : nome);
+        req.put("senha", senha.isEmpty() ? JSONObject.NULL : senha);
+
+        enviarRequisicao(saida, req);
+        receberResposta(entrada);
+    }
+
+    // ─── ADM DELETE ─────────────────────────────────────────────────────────────
+
+    private void deletarUsuarioAdmin(Scanner scanner, String tokenAdmin, PrintWriter saida, BufferedReader entrada) throws IOException {
+        System.out.println("\n--- DELETAR USUÁRIO (ADM) ---");
+        System.out.print("Usuário a deletar: ");
+        String usuario = scanner.nextLine().trim();
+
+        System.out.print("Tem certeza? Esta ação é irreversível. (s/N): ");
+        String confirmacao = scanner.nextLine().trim();
+        if (!confirmacao.equalsIgnoreCase("s")) {
+            System.out.println("[SISTEMA] Operação cancelada.");
+            return;
+        }
+
+        JSONObject req = new JSONObject();
+        req.put("op",          "deletarUsuarioAdmin");
+        req.put("token_admin", tokenAdmin);
+        req.put("usuario",     usuario);
+
+        enviarRequisicao(saida, req);
+        receberResposta(entrada);
     }
 
     // ─── AUXILIARES ───────────────────────────────────────────────────────────

@@ -1,5 +1,6 @@
 package com.sistemasdistribuidos.servidor;
 
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
@@ -13,6 +14,8 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class Servidor {
+
+    private static final String TOKEN_ADMIN = "adm";    // token fixo de administrador (enviado manualmente pelo cliente)
 
     private final int porta;
     private final Map<String, JSONObject> bancoUsuarios = new ConcurrentHashMap<>();
@@ -75,6 +78,13 @@ public class Servidor {
             case "consultarUsuario": consultarUsuario(jsonRecebido, saida); break;
             case "atualizarUsuario": atualizarUsuario(jsonRecebido, saida); break;
             case "deletarUsuario":   deletarUsuario(jsonRecebido, saida);   break;
+
+            // ── ENTREGA 2 — ADMIN ──
+            case "consultarUsuariosAdmin": consultarUsuariosAdmin(jsonRecebido, saida); break;
+            case "consultarUsuarioAdmin":  consultarUsuarioAdmin(jsonRecebido, saida);  break;
+            case "atualizarUsuarioAdmin":  atualizarUsuarioAdmin(jsonRecebido, saida);  break;
+            case "deletarUsuarioAdmin":    deletarUsuarioAdmin(jsonRecebido, saida);    break;
+
             default:                 enviarErro(saida, "Operação desconhecida: " + op);
         }
     }
@@ -252,7 +262,146 @@ public class Servidor {
         enviarJSON(saida, resp);
     }
 
+    // ═══ ENTREGA 2 — ADMIN ══════════════════════════════════════════════════════
+
+    // ─── ADM LIST (consultar todos usuários) ────────────────────────────────────
+
+    private void consultarUsuariosAdmin(JSONObject dados, PrintWriter saida) {
+        if (!autenticarAdmin(dados, saida, "Deve ser ADM para consultar a lista")) return;
+
+        JSONArray lista = new JSONArray();
+        for (JSONObject registro : bancoUsuarios.values()) {
+            JSONObject item = new JSONObject();
+            item.put("usuario", registro.getString("usuario"));
+            item.put("nome",    registro.getString("nome"));
+            lista.put(item);
+        }
+
+        JSONObject resp = new JSONObject();
+        resp.put("resposta",       "200");
+        resp.put("lista_usuarios", lista);
+        enviarJSON(saida, resp);
+    }
+
+    // ─── ADM READ (consultar usuário) ───────────────────────────────────────────
+
+    private void consultarUsuarioAdmin(JSONObject dados, PrintWriter saida) {
+        if (!autenticarAdmin(dados, saida, "Token Inválido")) return;
+
+        if (!dados.has("usuario") || dados.getString("usuario").trim().isEmpty()) {
+            enviarErro(saida, "Campo obrigatório ausente: 'usuario'.");
+            return;
+        }
+
+        String usuario = dados.getString("usuario").trim();
+        JSONObject registro = bancoUsuarios.get(usuario);
+        if (registro == null) {
+            enviarErro(saida, "Usuário não encontrado.");
+            return;
+        }
+
+        JSONObject resp = new JSONObject();
+        resp.put("resposta", "200");
+        resp.put("nome",     registro.getString("nome"));
+        resp.put("usuario",  registro.getString("usuario"));
+        enviarJSON(saida, resp);
+    }
+
+    // ─── ADM UPDATE (atualizar usuário) ─────────────────────────────────────────
+
+    private void atualizarUsuarioAdmin(JSONObject dados, PrintWriter saida) {
+        if (!autenticarAdmin(dados, saida, "Token Inválido")) return;
+
+        if (!dados.has("usuario") || dados.getString("usuario").trim().isEmpty()) {
+            enviarErro(saida, "Campo obrigatório ausente: 'usuario'.");
+            return;
+        }
+
+        String usuario = dados.getString("usuario").trim();
+        JSONObject registro = bancoUsuarios.get(usuario);
+        if (registro == null) {
+            enviarErro(saida, "Usuário não encontrado.");
+            return;
+        }
+
+        // Atualização parcial: o ADM envia como nulo o que não quer mudar.
+        boolean alterouAlgo = false;
+
+        if (dados.has("nome") && !dados.isNull("nome")) {
+            String novoNome = dados.getString("nome").trim();
+            if (!novoNome.isEmpty()) {
+                registro.put("nome", novoNome);
+                alterouAlgo = true;
+            }
+        }
+
+        if (dados.has("senha") && !dados.isNull("senha")) {
+            String novaSenha = dados.getString("senha").trim();
+            if (!novaSenha.isEmpty()) {
+                if (!novaSenha.matches("^\\d{6}$")) {
+                    enviarErro(saida, "Senha inválida. Use apenas números e exatamente 6 dígitos.");
+                    return;
+                }
+                registro.put("senha", novaSenha);
+                alterouAlgo = true;
+            }
+        }
+
+        if (!alterouAlgo) {
+            enviarErro(saida, "Nenhum campo válido enviado para atualização.");
+            return;
+        }
+
+        JSONObject resp = new JSONObject();
+        resp.put("resposta", "200");
+        resp.put("mensagem", "Usuario atualizado com sucesso");
+        enviarJSON(saida, resp);
+    }
+
+    // ─── ADM DELETE (deletar usuário) ───────────────────────────────────────────
+
+    private void deletarUsuarioAdmin(JSONObject dados, PrintWriter saida) {
+        if (!autenticarAdmin(dados, saida, "Token Inválido")) return;
+
+        if (!dados.has("usuario") || dados.getString("usuario").trim().isEmpty()) {
+            enviarErro(saida, "Campo obrigatório ausente: 'usuario'.");
+            return;
+        }
+
+        String usuario = dados.getString("usuario").trim();
+        if (!bancoUsuarios.containsKey(usuario)) {
+            enviarErro(saida, "Usuário não encontrado.");
+            return;
+        }
+
+        bancoUsuarios.remove(usuario);
+        sessoes.values().removeIf(u -> u.equals(usuario)); // encerra sessões ativas do usuário removido
+
+        JSONObject resp = new JSONObject();
+        resp.put("resposta", "200");
+        resp.put("mensagem", "Usuario deletado com sucesso");
+        enviarJSON(saida, resp);
+    }
+
     // ─── AUXILIARES ───────────────────────────────────────────────────────────
+
+    // Valida o token de administrador recebido manualmente. O admin autentica
+    // apenas pelo token — não há senha. msgErro permite a mensagem específica de
+    // cada operação conforme o protocolo da disciplina.
+    private boolean autenticarAdmin(JSONObject dados, PrintWriter saida, String msgErro) {
+        if (!dados.has("token_admin") || dados.isNull("token_admin")) {
+            enviarErro(saida, msgErro);
+            return false;
+        }
+        // Match exato, sem trim: o token admin deve ser o literal "adm" conforme o
+        // protocolo. "adm ", " adm", "ADM", "4dm1n" etc. são rejeitados.
+        String tokenAdmin = dados.getString("token_admin");
+        if (!tokenAdmin.equals(TOKEN_ADMIN)) {
+            enviarErro(saida, msgErro);
+            return false;
+        }
+        return true;
+    }
 
     private String autenticar(JSONObject dados, PrintWriter saida) {
         // Passo 1 — campo presente e não vazio
