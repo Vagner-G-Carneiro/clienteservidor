@@ -21,8 +21,7 @@ public class Cliente {
         this.porta = porta;
     }
 
-    public void iniciar() {
-        Scanner scanner = new Scanner(System.in);
+    public void iniciar(Scanner scanner) {
         System.out.println("[SISTEMA] Conectando ao servidor " + ip + ":" + porta + "...");
 
         try (Socket socket = new Socket(ip, porta);
@@ -231,14 +230,46 @@ public class Cliente {
     }
 
     // ═══ ENTREGA 2 — ÁREA ADMINISTRATIVA ════════════════════════════════════════
-    // O token de administrador é digitado MANUALMENTE pelo cliente e enviado ao
-    // servidor. Isso permite consumir servidores de terceiros (cada um com seu token).
+    // O administrador autentica fazendo login normal (admin/123456). O token de
+    // sessão resultante — com role "adm" — é o que autoriza as operações de admin.
 
     private void areaAdministrativa(Scanner scanner, PrintWriter saida, BufferedReader entrada) throws IOException {
         System.out.println("\n--- ÁREA ADMINISTRATIVA ---");
-        System.out.print("Token de administrador: ");
-        String tokenAdmin = scanner.nextLine().trim();
+        System.out.print("Usuário: ");
+        String usuario = scanner.nextLine().trim();
+        System.out.print("Senha: ");
+        String senha = scanner.nextLine().trim();
 
+        // Autentica via login: somente o admin recebe um token com privilégios.
+        JSONObject login = new JSONObject();
+        login.put("op",      "login");
+        login.put("usuario", usuario);
+        login.put("senha",   senha);
+        enviarRequisicao(saida, login);
+        JSONObject resp = receberResposta(entrada);
+
+        if (resp == null || !"200".equals(resp.optString("resposta"))) {
+            return; // mensagem de falha já exibida por receberResposta
+        }
+        String tokenAdmin = resp.getString("token");
+        if (!tokenAdmin.startsWith("adm_")) {
+            System.err.println("[FALHA] Este usuário não possui privilégios de administrador.");
+            return;
+        }
+
+        try {
+            menuAdmin(scanner, tokenAdmin, saida, entrada);
+        } finally {
+            // Encerra a sessão administrativa ao sair da área.
+            JSONObject logout = new JSONObject();
+            logout.put("op",    "logout");
+            logout.put("token", tokenAdmin);
+            enviarRequisicao(saida, logout);
+            receberResposta(entrada);
+        }
+    }
+
+    private void menuAdmin(Scanner scanner, String tokenAdmin, PrintWriter saida, BufferedReader entrada) throws IOException {
         while (true) {
             System.out.println("\n---=== Menu Admin ===---");
             System.out.println("| 1 - Listar todos usuários |");
@@ -266,8 +297,8 @@ public class Cliente {
         System.out.println("\n--- LISTAR TODOS USUÁRIOS (ADM) ---");
 
         JSONObject req = new JSONObject();
-        req.put("op",          "consultarUsuariosAdmin");
-        req.put("token_admin", tokenAdmin);
+        req.put("op",    "consultarUsuariosAdmin");
+        req.put("token", tokenAdmin);
 
         enviarRequisicao(saida, req);
         JSONObject resp = receberResposta(entrada);
@@ -294,9 +325,9 @@ public class Cliente {
         String usuario = scanner.nextLine().trim();
 
         JSONObject req = new JSONObject();
-        req.put("op",          "consultarUsuarioAdmin");
-        req.put("token_admin", tokenAdmin);
-        req.put("usuario",     usuario);
+        req.put("op",      "consultarUsuarioAdmin");
+        req.put("token",   tokenAdmin);
+        req.put("usuario", usuario);
 
         enviarRequisicao(saida, req);
         JSONObject resp = receberResposta(entrada);
@@ -322,9 +353,9 @@ public class Cliente {
         String senha = scanner.nextLine().trim();
 
         JSONObject req = new JSONObject();
-        req.put("op",          "atualizarUsuarioAdmin");
-        req.put("token_admin", tokenAdmin);
-        req.put("usuario",     usuario);
+        req.put("op",      "atualizarUsuarioAdmin");
+        req.put("token",   tokenAdmin);
+        req.put("usuario", usuario);
         // Campo em branco é enviado como nulo, conforme o protocolo.
         req.put("nome",  nome.isEmpty()  ? JSONObject.NULL : nome);
         req.put("senha", senha.isEmpty() ? JSONObject.NULL : senha);
@@ -348,9 +379,9 @@ public class Cliente {
         }
 
         JSONObject req = new JSONObject();
-        req.put("op",          "deletarUsuarioAdmin");
-        req.put("token_admin", tokenAdmin);
-        req.put("usuario",     usuario);
+        req.put("op",      "deletarUsuarioAdmin");
+        req.put("token",   tokenAdmin);
+        req.put("usuario", usuario);
 
         enviarRequisicao(saida, req);
         receberResposta(entrada);
@@ -417,6 +448,6 @@ public class Cliente {
         int porta = scanner.nextInt();
         scanner.nextLine();
 
-        new Cliente(ip, porta).iniciar();
+        new Cliente(ip, porta).iniciar(scanner); // mesmo Scanner do setup, evita perda de buffer
     }
 }

@@ -15,7 +15,12 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public class Servidor {
 
-    private static final String TOKEN_ADMIN = "adm";    // token fixo de administrador (enviado manualmente pelo cliente)
+    // Conta de administrador padrão — sempre disponível, login fixo admin/123456.
+    private static final String ADMIN_USUARIO = "admin";
+    private static final String ADMIN_SENHA   = "123456";
+
+    private static final String ROLE_USER  = "usr";  // sessão de usuário comum
+    private static final String ROLE_ADMIN = "adm";  // sessão de administrador
 
     private final int porta;
     private final Map<String, JSONObject> bancoUsuarios = new ConcurrentHashMap<>();
@@ -23,6 +28,16 @@ public class Servidor {
 
     public Servidor(int porta) {
         this.porta = porta;
+        semearAdmin();
+    }
+
+    // Garante que a conta de administrador exista desde a inicialização.
+    private void semearAdmin() {
+        JSONObject admin = new JSONObject();
+        admin.put("nome",    "Administrador");
+        admin.put("usuario", ADMIN_USUARIO);
+        admin.put("senha",   ADMIN_SENHA);
+        bancoUsuarios.put(ADMIN_USUARIO, admin);
     }
 
     public void iniciar() {
@@ -162,7 +177,9 @@ public class Servidor {
             return;
         }
 
-        String token = "usr_" + usuario;
+        // O admin recebe um token com role "adm"; demais usuários, role "usr".
+        String role  = usuario.equals(ADMIN_USUARIO) ? ROLE_ADMIN : ROLE_USER;
+        String token = role + "_" + usuario;
         sessoes.put(token, usuario);
 
         JSONObject resp = new JSONObject();
@@ -369,6 +386,10 @@ public class Servidor {
         }
 
         String usuario = dados.getString("usuario").trim();
+        if (usuario.equals(ADMIN_USUARIO)) {
+            enviarErro(saida, "A conta de administrador não pode ser removida.");
+            return;
+        }
         if (!bancoUsuarios.containsKey(usuario)) {
             enviarErro(saida, "Usuário não encontrado.");
             return;
@@ -385,18 +406,18 @@ public class Servidor {
 
     // ─── AUXILIARES ───────────────────────────────────────────────────────────
 
-    // Valida o token de administrador recebido manualmente. O admin autentica
-    // apenas pelo token — não há senha. msgErro permite a mensagem específica de
-    // cada operação conforme o protocolo da disciplina.
+    // Autoriza operações de administrador. O admin se autentica via login normal
+    // (admin/123456) e usa o token de sessão resultante. Só é admin quem possui
+    // uma sessão ativa cujo dono é o usuário ADMIN_USUARIO. msgErro permite a
+    // mensagem específica de cada operação conforme o protocolo da disciplina.
     private boolean autenticarAdmin(JSONObject dados, PrintWriter saida, String msgErro) {
-        if (!dados.has("token_admin") || dados.isNull("token_admin")) {
+        if (!dados.has("token") || dados.isNull("token")) {
             enviarErro(saida, msgErro);
             return false;
         }
-        // Match exato, sem trim: o token admin deve ser o literal "adm" conforme o
-        // protocolo. "adm ", " adm", "ADM", "4dm1n" etc. são rejeitados.
-        String tokenAdmin = dados.getString("token_admin");
-        if (!tokenAdmin.equals(TOKEN_ADMIN)) {
+        String token   = dados.getString("token").trim();
+        String usuario = sessoes.get(token);
+        if (usuario == null || !usuario.equals(ADMIN_USUARIO)) {
             enviarErro(saida, msgErro);
             return false;
         }
@@ -417,31 +438,25 @@ public class Servidor {
             return null;
         }
 
-        // Passo 2 — token "adm" é fixo e não representa sessão de usuário comum
-        if (token.equals("adm")) {
-            enviarErro(saida, "Token inválido.");
-            return null;
-        }
-
-        // Passo 3 e 4 — dividir pelo separador e exigir exatamente 2 partes
+        // Passo 2 e 3 — dividir pelo separador e exigir exatamente 2 partes
         String[] partes = token.split("_");
         if (partes.length != 2) {
             enviarErro(saida, "Token inválido.");
             return null;
         }
 
-        // Passo 5 — extrair role e nome
+        // Passo 4 — extrair role e nome
         String role        = partes[0];
         String nomeUsuario = partes[1];
 
-        // Passo 6 — validar nome: alfanumérico, entre 5 e 20 caracteres
+        // Passo 5 — validar nome: alfanumérico, entre 5 e 20 caracteres
         if (!nomeUsuario.matches("[a-zA-Z0-9]{5,20}")) {
             enviarErro(saida, "Token inválido.");
             return null;
         }
 
-        // Passo 7 — validar role
-        if (!role.equals("usr")) {
+        // Passo 6 — operações de usuário comum exigem role "usr" (admin usa as ops de admin)
+        if (!role.equals(ROLE_USER)) {
             enviarErro(saida, "Token inválido.");
             return null;
         }
