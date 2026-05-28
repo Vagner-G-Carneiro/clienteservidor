@@ -179,6 +179,18 @@ public class Cliente {
         }
 
         System.out.println("\n--- ATUALIZAR USUÁRIO ---");
+        // Rubrica d): "O cliente deve mostrar um campo para a digitação do token
+        // antes do envio da mensagem". Mostramos o token atual apenas como dica e
+        // deixamos o avaliador digitar/colar livremente — inclusive um token de
+        // outro usuário, para verificar que o servidor recusa (item i).
+        System.out.println("[DICA] Seu token atual: " + tokenAtual);
+        System.out.print("Token: ");
+        String token = scanner.nextLine().trim();
+        if (token.isEmpty()) {
+            System.err.println("[FALHA] Token não pode estar vazio.");
+            return;
+        }
+
         System.out.print("Novo nome: ");
         String nome = scanner.nextLine().trim();
 
@@ -192,7 +204,7 @@ public class Cliente {
 
         JSONObject req = new JSONObject();
         req.put("op",    "atualizarUsuario");
-        req.put("token", tokenAtual);
+        req.put("token", token);
         req.put("nome",  nome);
         req.put("senha", senha);
 
@@ -209,6 +221,17 @@ public class Cliente {
         }
 
         System.out.println("\n--- DELETAR CONTA ---");
+        // Rubrica e): "O cliente deve mostrar um campo para a digitação do token
+        // antes do envio da mensagem". O token vai como campo livre para permitir
+        // o teste de fraude (item j: servidor recusa token de outro usuário).
+        System.out.println("[DICA] Seu token atual: " + tokenAtual);
+        System.out.print("Token: ");
+        String token = scanner.nextLine().trim();
+        if (token.isEmpty()) {
+            System.err.println("[FALHA] Token não pode estar vazio.");
+            return;
+        }
+
         System.out.print("Tem certeza? Esta ação é irreversível. (s/N): ");
         String confirmacao = scanner.nextLine().trim();
 
@@ -219,12 +242,15 @@ public class Cliente {
 
         JSONObject req = new JSONObject();
         req.put("op",    "deletarUsuario");
-        req.put("token", tokenAtual);
+        req.put("token", token);
 
         enviarRequisicao(saida, req);
         JSONObject resp = receberResposta(entrada);
 
-        if (resp != null && "200".equals(resp.optString("resposta"))) {
+        // Só limpa a sessão local se a conta deletada era de fato a do próprio
+        // usuário logado — assim, uma tentativa de fraude com token alheio não
+        // afeta o estado do cliente.
+        if (resp != null && "200".equals(resp.optString("resposta")) && token.equals(tokenAtual)) {
             tokenAtual = null;
         }
     }
@@ -252,7 +278,7 @@ public class Cliente {
             return; // mensagem de falha já exibida por receberResposta
         }
         String tokenAdmin = resp.getString("token");
-        if (!tokenAdmin.startsWith("adm_")) {
+        if (!"adm".equals(tokenAdmin)) {
             System.err.println("[FALHA] Este usuário não possui privilégios de administrador.");
             return;
         }
@@ -297,8 +323,8 @@ public class Cliente {
         System.out.println("\n--- LISTAR TODOS USUÁRIOS (ADM) ---");
 
         JSONObject req = new JSONObject();
-        req.put("op",    "consultarUsuariosAdmin");
-        req.put("token", tokenAdmin);
+        req.put("op",          "consultarUsuariosAdmin");
+        req.put("token_admin", tokenAdmin);
 
         enviarRequisicao(saida, req);
         JSONObject resp = receberResposta(entrada);
@@ -325,9 +351,9 @@ public class Cliente {
         String usuario = scanner.nextLine().trim();
 
         JSONObject req = new JSONObject();
-        req.put("op",      "consultarUsuarioAdmin");
-        req.put("token",   tokenAdmin);
-        req.put("usuario", usuario);
+        req.put("op",          "consultarUsuarioAdmin");
+        req.put("token_admin", tokenAdmin);
+        req.put("usuario",     usuario);
 
         enviarRequisicao(saida, req);
         JSONObject resp = receberResposta(entrada);
@@ -353,9 +379,9 @@ public class Cliente {
         String senha = scanner.nextLine().trim();
 
         JSONObject req = new JSONObject();
-        req.put("op",      "atualizarUsuarioAdmin");
-        req.put("token",   tokenAdmin);
-        req.put("usuario", usuario);
+        req.put("op",          "atualizarUsuarioAdmin");
+        req.put("token_admin", tokenAdmin);
+        req.put("usuario",     usuario);
         // Campo em branco é enviado como nulo, conforme o protocolo.
         req.put("nome",  nome.isEmpty()  ? JSONObject.NULL : nome);
         req.put("senha", senha.isEmpty() ? JSONObject.NULL : senha);
@@ -379,9 +405,9 @@ public class Cliente {
         }
 
         JSONObject req = new JSONObject();
-        req.put("op",      "deletarUsuarioAdmin");
-        req.put("token",   tokenAdmin);
-        req.put("usuario", usuario);
+        req.put("op",          "deletarUsuarioAdmin");
+        req.put("token_admin", tokenAdmin);
+        req.put("usuario",     usuario);
 
         enviarRequisicao(saida, req);
         receberResposta(entrada);

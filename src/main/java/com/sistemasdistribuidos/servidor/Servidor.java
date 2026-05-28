@@ -24,7 +24,15 @@ public class Servidor {
 
     private final int porta;
     private final Map<String, JSONObject> bancoUsuarios = new ConcurrentHashMap<>();
-    private final Map<String, String>     sessoes       = new ConcurrentHashMap<>(); // token → usuario
+    private final Map<String, Sessao>     sessoes       = new ConcurrentHashMap<>(); // token → sessão (usuário + IP)
+
+    // Sessão amarra o token ao IP do cliente que efetuou o login — detecta fraude
+    // quando outro IP tenta reusar o token (itens i/j da rubrica de avaliação).
+    private static final class Sessao {
+        final String usuario;
+        final String ip;
+        Sessao(String usuario, String ip) { this.usuario = usuario; this.ip = ip; }
+    }
 
     public Servidor(int porta) {
         this.porta = porta;
@@ -54,20 +62,21 @@ public class Servidor {
     }
 
     private void lidarComCliente(Socket socket) {
+        String ipCliente = socket.getInetAddress().getHostAddress();
         try (BufferedReader entrada = new BufferedReader(new InputStreamReader(socket.getInputStream()));
             PrintWriter saida = new PrintWriter(socket.getOutputStream(), true)) {
-            System.out.println("[SISTEMA] Cliente conectado: " + socket.getInetAddress() + ":" + socket.getPort());
+            System.out.println("[SISTEMA] Cliente conectado: " + ipCliente + ":" + socket.getPort());
             String linha;
             while ((linha = entrada.readLine()) != null) {
                 try {
                     JSONObject jsonRecebido = new JSONObject(linha);
 
                     // Log local: imprime o que chegou pela rede — nada é transmitido de volta aqui
-                    System.out.println("\n[ RECEBIDO ← CLIENTE ]");
+                    System.out.println("\n[ RECEBIDO ← CLIENTE " + ipCliente + " ]");
                     System.out.println(jsonRecebido.toString(4));
                     System.out.println("--------------------------------------------------");
 
-                    processarRequisicao(jsonRecebido, saida);
+                    processarRequisicao(jsonRecebido, saida, ipCliente);
 
                 } catch (JSONException e) {
                     enviarErro(saida, "JSON malformado recebido.");
@@ -78,7 +87,7 @@ public class Servidor {
         }
     }
 
-    private void processarRequisicao(JSONObject jsonRecebido, PrintWriter saida) {
+    private void processarRequisicao(JSONObject jsonRecebido, PrintWriter saida, String ipCliente) {
         if (!jsonRecebido.has("op")) {
             enviarErro(saida, "Toda mensagem JSON precisa do campo 'op'.");
             return;
@@ -88,17 +97,17 @@ public class Servidor {
 
         switch (op) {
             case "cadastrarUsuario": cadastrarUsuario(jsonRecebido, saida); break;
-            case "login":            login(jsonRecebido, saida);            break;
+            case "login":            login(jsonRecebido, saida, ipCliente); break;
             case "logout":           logout(jsonRecebido, saida);           break;
-            case "consultarUsuario": consultarUsuario(jsonRecebido, saida); break;
-            case "atualizarUsuario": atualizarUsuario(jsonRecebido, saida); break;
-            case "deletarUsuario":   deletarUsuario(jsonRecebido, saida);   break;
+            case "consultarUsuario": consultarUsuario(jsonRecebido, saida, ipCliente); break;
+            case "atualizarUsuario": atualizarUsuario(jsonRecebido, saida, ipCliente); break;
+            case "deletarUsuario":   deletarUsuario(jsonRecebido, saida, ipCliente);   break;
 
             // ── ENTREGA 2 — ADMIN ──
-            case "consultarUsuariosAdmin": consultarUsuariosAdmin(jsonRecebido, saida); break;
-            case "consultarUsuarioAdmin":  consultarUsuarioAdmin(jsonRecebido, saida);  break;
-            case "atualizarUsuarioAdmin":  atualizarUsuarioAdmin(jsonRecebido, saida);  break;
-            case "deletarUsuarioAdmin":    deletarUsuarioAdmin(jsonRecebido, saida);    break;
+            case "consultarUsuariosAdmin": consultarUsuariosAdmin(jsonRecebido, saida, ipCliente); break;
+            case "consultarUsuarioAdmin":  consultarUsuarioAdmin(jsonRecebido, saida, ipCliente);  break;
+            case "atualizarUsuarioAdmin":  atualizarUsuarioAdmin(jsonRecebido, saida, ipCliente);  break;
+            case "deletarUsuarioAdmin":    deletarUsuarioAdmin(jsonRecebido, saida, ipCliente);    break;
 
             default:                 enviarErro(saida, "Operação desconhecida: " + op);
         }
@@ -149,7 +158,7 @@ public class Servidor {
 
     // ─── LOGIN ────────────────────────────────────────────────────────────────
 
-    private void login(JSONObject dados, PrintWriter saida) {
+    private void login(JSONObject dados, PrintWriter saida, String ipCliente) {
         if (!dados.has("usuario") || !dados.has("senha")) {
             enviarErro(saida, "Campos obrigatórios ausentes. Esperado: 'usuario' e 'senha'.");
             return;
@@ -177,10 +186,11 @@ public class Servidor {
             return;
         }
 
-        // O admin recebe um token com role "adm"; demais usuários, role "usr".
-        String role  = usuario.equals(ADMIN_USUARIO) ? ROLE_ADMIN : ROLE_USER;
-        String token = role + "_" + usuario;
-        sessoes.put(token, usuario);
+        // Protocolo: token do admin é literalmente "adm"; demais usuários, "usr_<usuario>".
+        // O servidor guarda o token E o IP — qualquer request com esse token vindo
+        // de outro IP é tratada como fraude e rejeitada (itens i/j da rubrica).
+        String token = usuario.equals(ADMIN_USUARIO) ? ROLE_ADMIN : (ROLE_USER + "_" + usuario);
+        sessoes.put(token, new Sessao(usuario, ipCliente));
 
         JSONObject resp = new JSONObject();
         resp.put("resposta", "200");
@@ -217,8 +227,8 @@ public class Servidor {
 
     // ─── READ ─────────────────────────────────────────────────────────────────
 
-    private void consultarUsuario(JSONObject dados, PrintWriter saida) {
-        String usuario = autenticar(dados, saida);
+    private void consultarUsuario(JSONObject dados, PrintWriter saida, String ipCliente) {
+        String usuario = autenticar(dados, saida, ipCliente);
         if (usuario == null) return;
 
         JSONObject registro = bancoUsuarios.get(usuario);
@@ -232,8 +242,8 @@ public class Servidor {
 
     // ─── UPDATE ───────────────────────────────────────────────────────────────
 
-    private void atualizarUsuario(JSONObject dados, PrintWriter saida) {
-        String usuario = autenticar(dados, saida);
+    private void atualizarUsuario(JSONObject dados, PrintWriter saida, String ipCliente) {
+        String usuario = autenticar(dados, saida, ipCliente);
         if (usuario == null) return;
 
         if (!dados.has("nome") || !dados.has("senha")) {
@@ -265,8 +275,8 @@ public class Servidor {
 
     // ─── DELETE ───────────────────────────────────────────────────────────────
 
-    private void deletarUsuario(JSONObject dados, PrintWriter saida) {
-        String usuario = autenticar(dados, saida);
+    private void deletarUsuario(JSONObject dados, PrintWriter saida, String ipCliente) {
+        String usuario = autenticar(dados, saida, ipCliente);
         if (usuario == null) return;
 
         String token = dados.getString("token").trim();
@@ -283,8 +293,8 @@ public class Servidor {
 
     // ─── ADM LIST (consultar todos usuários) ────────────────────────────────────
 
-    private void consultarUsuariosAdmin(JSONObject dados, PrintWriter saida) {
-        if (!autenticarAdmin(dados, saida, "Deve ser ADM para consultar a lista")) return;
+    private void consultarUsuariosAdmin(JSONObject dados, PrintWriter saida, String ipCliente) {
+        if (!autenticarAdmin(dados, saida, ipCliente, "Deve ser ADM para consultar a lista")) return;
 
         JSONArray lista = new JSONArray();
         for (JSONObject registro : bancoUsuarios.values()) {
@@ -302,8 +312,8 @@ public class Servidor {
 
     // ─── ADM READ (consultar usuário) ───────────────────────────────────────────
 
-    private void consultarUsuarioAdmin(JSONObject dados, PrintWriter saida) {
-        if (!autenticarAdmin(dados, saida, "Token Inválido")) return;
+    private void consultarUsuarioAdmin(JSONObject dados, PrintWriter saida, String ipCliente) {
+        if (!autenticarAdmin(dados, saida, ipCliente, "Token Inválido")) return;
 
         if (!dados.has("usuario") || dados.getString("usuario").trim().isEmpty()) {
             enviarErro(saida, "Campo obrigatório ausente: 'usuario'.");
@@ -326,8 +336,8 @@ public class Servidor {
 
     // ─── ADM UPDATE (atualizar usuário) ─────────────────────────────────────────
 
-    private void atualizarUsuarioAdmin(JSONObject dados, PrintWriter saida) {
-        if (!autenticarAdmin(dados, saida, "Token Inválido")) return;
+    private void atualizarUsuarioAdmin(JSONObject dados, PrintWriter saida, String ipCliente) {
+        if (!autenticarAdmin(dados, saida, ipCliente, "Token Inválido")) return;
 
         if (!dados.has("usuario") || dados.getString("usuario").trim().isEmpty()) {
             enviarErro(saida, "Campo obrigatório ausente: 'usuario'.");
@@ -377,8 +387,8 @@ public class Servidor {
 
     // ─── ADM DELETE (deletar usuário) ───────────────────────────────────────────
 
-    private void deletarUsuarioAdmin(JSONObject dados, PrintWriter saida) {
-        if (!autenticarAdmin(dados, saida, "Token Inválido")) return;
+    private void deletarUsuarioAdmin(JSONObject dados, PrintWriter saida, String ipCliente) {
+        if (!autenticarAdmin(dados, saida, ipCliente, "Token Inválido")) return;
 
         if (!dados.has("usuario") || dados.getString("usuario").trim().isEmpty()) {
             enviarErro(saida, "Campo obrigatório ausente: 'usuario'.");
@@ -396,7 +406,7 @@ public class Servidor {
         }
 
         bancoUsuarios.remove(usuario);
-        sessoes.values().removeIf(u -> u.equals(usuario)); // encerra sessões ativas do usuário removido
+        sessoes.values().removeIf(s -> s.usuario.equals(usuario)); // encerra sessões ativas do usuário removido
 
         JSONObject resp = new JSONObject();
         resp.put("resposta", "200");
@@ -410,21 +420,28 @@ public class Servidor {
     // (admin/123456) e usa o token de sessão resultante. Só é admin quem possui
     // uma sessão ativa cujo dono é o usuário ADMIN_USUARIO. msgErro permite a
     // mensagem específica de cada operação conforme o protocolo da disciplina.
-    private boolean autenticarAdmin(JSONObject dados, PrintWriter saida, String msgErro) {
-        if (!dados.has("token") || dados.isNull("token")) {
+    private boolean autenticarAdmin(JSONObject dados, PrintWriter saida, String ipCliente, String msgErro) {
+        if (!dados.has("token_admin") || dados.isNull("token_admin")) {
             enviarErro(saida, msgErro);
             return false;
         }
-        String token   = dados.getString("token").trim();
-        String usuario = sessoes.get(token);
-        if (usuario == null || !usuario.equals(ADMIN_USUARIO)) {
+        String token  = dados.getString("token_admin").trim();
+        Sessao sessao = sessoes.get(token);
+        if (sessao == null || !sessao.usuario.equals(ADMIN_USUARIO)) {
+            enviarErro(saida, msgErro);
+            return false;
+        }
+        // Token amarrado ao IP de login — outro IP usando o mesmo token = fraude.
+        if (!sessao.ip.equals(ipCliente)) {
+            System.out.println("[ALERTA] Fraude: token_admin '" + token + "' usado por IP "
+                    + ipCliente + " (sessão registrada em " + sessao.ip + ")");
             enviarErro(saida, msgErro);
             return false;
         }
         return true;
     }
 
-    private String autenticar(JSONObject dados, PrintWriter saida) {
+    private String autenticar(JSONObject dados, PrintWriter saida, String ipCliente) {
         // Passo 1 — campo presente e não vazio
         if (!dados.has("token")) {
             enviarErro(saida, "Campo obrigatório ausente: 'token'.");
@@ -462,13 +479,23 @@ public class Servidor {
         }
 
         // Parse concluído — verifica se há sessão ativa para esse token
-        String usuario = sessoes.get(token);
-        if (usuario == null) {
+        Sessao sessao = sessoes.get(token);
+        if (sessao == null) {
             enviarErro(saida, "Token inválido.");
             return null;
         }
 
-        return usuario;
+        // Defesa contra fraude: o token só vale a partir do IP que efetuou o login.
+        // Itens i/j da rubrica: "Servidor não permite que usuário comum consiga
+        // editar/apagar dados que não seus".
+        if (!sessao.ip.equals(ipCliente)) {
+            System.out.println("[ALERTA] Fraude: token '" + token + "' usado por IP "
+                    + ipCliente + " (sessão registrada em " + sessao.ip + ")");
+            enviarErro(saida, "Token inválido.");
+            return null;
+        }
+
+        return sessao.usuario;
     }
 
     // Log local + envio pela rede — payload contém apenas o que o protocolo define
