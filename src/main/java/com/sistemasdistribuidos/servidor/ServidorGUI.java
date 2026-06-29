@@ -21,6 +21,11 @@ import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.util.ArrayList;
+import java.util.Enumeration;
 import java.util.List;
 
 // Interface gráfica do servidor (itens g, h da rubrica EP-3): campo de porta,
@@ -64,6 +69,12 @@ public class ServidorGUI extends JFrame implements Servidor.Ouvinte {
         status.setBackground(Color.GRAY);
         status.setBorder(BorderFactory.createEmptyBorder(4, 10, 4, 10));
         topo.add(status);
+
+        // Mostra o(s) IP(s) desta máquina — é o que os colegas usam no cliente
+        // deles para se conectar a este servidor.
+        JLabel rotuloIp = new JLabel("Seu IP: " + descobrirIPs());
+        rotuloIp.setFont(rotuloIp.getFont().deriveFont(Font.BOLD));
+        topo.add(rotuloIp);
         add(topo, BorderLayout.NORTH);
 
         // ── Centro: lista de logados | log ──
@@ -120,6 +131,29 @@ public class ServidorGUI extends JFrame implements Servidor.Ouvinte {
     private void definirStatus(String texto, Color cor) {
         status.setText(texto);
         status.setBackground(cor);
+    }
+
+    // Descobre os IPv4 reais da máquina (ignora loopback/virtuais). É o endereço
+    // que os outros computadores da rede usam para alcançar este servidor.
+    private static String descobrirIPs() {
+        List<String> ips = new ArrayList<>();
+        try {
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces.hasMoreElements()) {
+                NetworkInterface ni = interfaces.nextElement();
+                if (!ni.isUp() || ni.isLoopback() || ni.isVirtual()) continue;
+                Enumeration<InetAddress> enderecos = ni.getInetAddresses();
+                while (enderecos.hasMoreElements()) {
+                    InetAddress addr = enderecos.nextElement();
+                    if (addr instanceof Inet4Address && addr.isSiteLocalAddress()) {
+                        ips.add(addr.getHostAddress());
+                    }
+                }
+            }
+        } catch (Exception ignorado) {
+            // Sem rede ou sem permissão para enumerar — cai no fallback abaixo.
+        }
+        return ips.isEmpty() ? "127.0.0.1 (rede indisponível)" : String.join("  |  ", ips);
     }
 
     // ── Servidor.Ouvinte — chamado por threads do servidor; volta para a EDT ──
