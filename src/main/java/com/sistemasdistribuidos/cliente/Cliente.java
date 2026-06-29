@@ -9,12 +9,26 @@ import java.io.InputStreamReader;
 import java.io.PrintWriter;
 import java.net.Socket;
 import java.util.Scanner;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class Cliente {
+
+    // Tempo de espera por uma resposta de comando (login, cadastro, consultas...).
+    private static final long TIMEOUT_RESPOSTA = 5000;
 
     private final String ip;
     private final int    porta;
     private String tokenAtual = null; // null = deslogado
+
+    // O servidor pode empurrar uma 'receberMensagem' a qualquer momento (S->C), então
+    // a leitura do socket vive numa thread separada (escutarServidor). As respostas de
+    // comando são entregues à thread do menu por este "correio": cada comando registra
+    // um futuro aqui antes de enviar, e o ouvinte o completa quando a resposta chega.
+    private final AtomicReference<CompletableFuture<JSONObject>> pendente = new AtomicReference<>();
+    private volatile boolean conectado = true;
 
     public Cliente(String ip, int porta) {
         this.ip    = ip;
@@ -30,18 +44,25 @@ public class Cliente {
 
             System.out.println("[SISTEMA] Conectado com sucesso!\n");
 
-            while (true) {
+            // Ouvinte assíncrono: lê tudo que vem do servidor (respostas + mensagens push).
+            Thread ouvinte = new Thread(() -> escutarServidor(entrada), "ouvinte-servidor");
+            ouvinte.setDaemon(true);
+            ouvinte.start();
+
+            while (conectado) {
                 exibirMenu();
                 String opcao = scanner.nextLine().trim();
 
                 switch (opcao) {
-                    case "1": realizarCadastro(scanner, saida, entrada);    break;
-                    case "2": realizarLogin(scanner, saida, entrada);       break;
-                    case "3": realizarLogout(saida, entrada);               break;
-                    case "4": consultarUsuario(saida, entrada);             break;
-                    case "5": atualizarUsuario(scanner, saida, entrada);    break;
-                    case "6": deletarUsuario(scanner, saida, entrada);      break;
-                    case "9": areaAdministrativa(scanner, saida, entrada);  break;
+                    case "1": realizarCadastro(scanner, saida);    break;
+                    case "2": realizarLogin(scanner, saida);       break;
+                    case "3": realizarLogout(saida);               break;
+                    case "4": consultarUsuario(saida);             break;
+                    case "5": atualizarUsuario(scanner, saida);    break;
+                    case "6": deletarUsuario(scanner, saida);      break;
+                    case "7": enviarMensagem(scanner, saida);      break;
+                    case "8": listarUsuariosLogados(saida);        break;
+                    case "9": areaAdministrativa(scanner, saida);  break;
                     default:  System.err.println("Opção inválida! Digite o número correspondente ao menu.");
                 }
             }
@@ -54,23 +75,25 @@ public class Cliente {
     private void exibirMenu() {
         System.out.println("\n---====== Menu ======---");
         if (tokenAtual == null) {
-            System.out.println("| 1 - Cadastrar Usuário |");
-            System.out.println("| 2 - Login             |");
+            System.out.println("| 1 - Cadastrar Usuário     |");
+            System.out.println("| 2 - Login                 |");
         } else {
-            System.out.println("| 3 - Logout            |");
-            System.out.println("| 4 - Consultar Usuário |");
-            System.out.println("| 5 - Atualizar Usuário |");
-            System.out.println("| 6 - Deletar Conta     |");
+            System.out.println("| 3 - Logout                |");
+            System.out.println("| 4 - Consultar Usuário     |");
+            System.out.println("| 5 - Atualizar Usuário     |");
+            System.out.println("| 6 - Deletar Conta         |");
+            System.out.println("| 7 - Enviar Mensagem       |");
+            System.out.println("| 8 - Listar Usuários Logados |");
             System.out.println("| Sessão: " + tokenAtual + " |");
         }
-        System.out.println("| 9 - Área Administrativa |");
+        System.out.println("| 9 - Área Administrativa   |");
         System.out.println("------------------------");
         System.out.print("Escolha uma opção: ");
     }
 
     // ─── CREATE ───────────────────────────────────────────────────────────────
 
-    private void realizarCadastro(Scanner scanner, PrintWriter saida, BufferedReader entrada) throws IOException {
+    private void realizarCadastro(Scanner scanner, PrintWriter saida) {
         if (tokenAtual != null) {
             System.err.println("[AVISO] Você já está logado. Faça logout antes de cadastrar outra conta.");
             return;
@@ -92,13 +115,12 @@ public class Cliente {
         req.put("usuario", usuario);
         req.put("senha",   senha);
 
-        enviarRequisicao(saida, req);
-        receberResposta(entrada);
+        enviarEAguardar(saida, req, TIMEOUT_RESPOSTA);
     }
 
     // ─── LOGIN ────────────────────────────────────────────────────────────────
 
-    private void realizarLogin(Scanner scanner, PrintWriter saida, BufferedReader entrada) throws IOException {
+    private void realizarLogin(Scanner scanner, PrintWriter saida) {
         if (tokenAtual != null) {
             System.err.println("[AVISO] Você já está logado. Faça logout primeiro.");
             return;
@@ -116,18 +138,20 @@ public class Cliente {
         req.put("usuario", usuario);
         req.put("senha",   senha);
 
-        enviarRequisicao(saida, req);
-        JSONObject resp = receberResposta(entrada);
+        JSONObject resp = enviarEAguardar(saida, req, TIMEOUT_RESPOSTA);
 
         if (resp != null && "200".equals(resp.optString("resposta"))) {
             tokenAtual = resp.getString("token");
             System.out.println("[SISTEMA] Token armazenado: " + tokenAtual);
+            // Protocolo (EP-3): logo após o login o cliente pede, automaticamente,
+            // a lista de usuários logados.
+            listarUsuariosLogados(saida);
         }
     }
 
     // ─── LOGOUT ───────────────────────────────────────────────────────────────
 
-    private void realizarLogout(PrintWriter saida, BufferedReader entrada) throws IOException {
+    private void realizarLogout(PrintWriter saida) {
         if (tokenAtual == null) {
             System.err.println("[AVISO] Você não está logado.");
             return;
@@ -139,8 +163,7 @@ public class Cliente {
         req.put("op",    "logout");
         req.put("token", tokenAtual);
 
-        enviarRequisicao(saida, req);
-        JSONObject resp = receberResposta(entrada);
+        JSONObject resp = enviarEAguardar(saida, req, TIMEOUT_RESPOSTA);
 
         if (resp != null && "200".equals(resp.optString("resposta"))) {
             tokenAtual = null;
@@ -149,7 +172,7 @@ public class Cliente {
 
     // ─── READ ─────────────────────────────────────────────────────────────────
 
-    private void consultarUsuario(PrintWriter saida, BufferedReader entrada) throws IOException {
+    private void consultarUsuario(PrintWriter saida) {
         if (tokenAtual == null) {
             System.err.println("[AVISO] Faça login para consultar seus dados.");
             return;
@@ -161,8 +184,7 @@ public class Cliente {
         req.put("op",    "consultarUsuario");
         req.put("token", tokenAtual);
 
-        enviarRequisicao(saida, req);
-        JSONObject resp = receberResposta(entrada);
+        JSONObject resp = enviarEAguardar(saida, req, TIMEOUT_RESPOSTA);
 
         if (resp != null && "200".equals(resp.optString("resposta"))) {
             System.out.println("[DADOS] Nome:    " + resp.optString("nome"));
@@ -172,7 +194,7 @@ public class Cliente {
 
     // ─── UPDATE ───────────────────────────────────────────────────────────────
 
-    private void atualizarUsuario(Scanner scanner, PrintWriter saida, BufferedReader entrada) throws IOException {
+    private void atualizarUsuario(Scanner scanner, PrintWriter saida) {
         if (tokenAtual == null) {
             System.err.println("[AVISO] Faça login para atualizar seus dados.");
             return;
@@ -208,13 +230,12 @@ public class Cliente {
         req.put("nome",  nome);
         req.put("senha", senha);
 
-        enviarRequisicao(saida, req);
-        receberResposta(entrada);
+        enviarEAguardar(saida, req, TIMEOUT_RESPOSTA);
     }
 
     // ─── DELETE ───────────────────────────────────────────────────────────────
 
-    private void deletarUsuario(Scanner scanner, PrintWriter saida, BufferedReader entrada) throws IOException {
+    private void deletarUsuario(Scanner scanner, PrintWriter saida) {
         if (tokenAtual == null) {
             System.err.println("[AVISO] Faça login para deletar sua conta.");
             return;
@@ -244,8 +265,7 @@ public class Cliente {
         req.put("op",    "deletarUsuario");
         req.put("token", token);
 
-        enviarRequisicao(saida, req);
-        JSONObject resp = receberResposta(entrada);
+        JSONObject resp = enviarEAguardar(saida, req, TIMEOUT_RESPOSTA);
 
         // Só limpa a sessão local se a conta deletada era de fato a do próprio
         // usuário logado — assim, uma tentativa de fraude com token alheio não
@@ -255,11 +275,77 @@ public class Cliente {
         }
     }
 
+    // ═══ ENTREGA 3 — MENSAGENS ═══════════════════════════════════════════════════
+
+    // ─── ENVIAR MENSAGEM (direta ou broadcast) ──────────────────────────────────
+
+    private void enviarMensagem(Scanner scanner, PrintWriter saida) {
+        if (tokenAtual == null) {
+            System.err.println("[AVISO] Faça login para enviar mensagens.");
+            return;
+        }
+
+        System.out.println("\n--- ENVIAR MENSAGEM ---");
+        System.out.print("Destinatário (ou /todos para broadcast): ");
+        String destinatario = scanner.nextLine().trim();
+
+        System.out.print("Mensagem: ");
+        String mensagem = scanner.nextLine();
+
+        if (destinatario.isEmpty() || mensagem.isEmpty()) {
+            System.err.println("[FALHA] Destinatário e mensagem devem estar preenchidos.");
+            return;
+        }
+
+        JSONObject req = new JSONObject();
+        req.put("op",           "enviarMensagem");
+        req.put("token",        tokenAtual);
+        req.put("destinatario", destinatario);
+        req.put("mensagem",     mensagem);
+
+        // O protocolo não define resposta de sucesso para 'enviarMensagem' (envio
+        // "fire-and-forget"). Em caso de erro — p.ex. destinatário offline — o
+        // servidor responde 401, que o ouvinte exibe assim que chega.
+        enviarRequisicao(saida, req);
+        System.out.println("[SISTEMA] Mensagem enviada para " + destinatario + ".");
+    }
+
+    // ─── LISTAR USUÁRIOS LOGADOS ────────────────────────────────────────────────
+
+    private void listarUsuariosLogados(PrintWriter saida) {
+        if (tokenAtual == null) {
+            System.err.println("[AVISO] Faça login para listar os usuários logados.");
+            return;
+        }
+
+        System.out.println("\n--- USUÁRIOS LOGADOS ---");
+
+        JSONObject req = new JSONObject();
+        req.put("op",    "listarUsuariosLogados");
+        req.put("token", tokenAtual);
+
+        JSONObject resp = enviarEAguardar(saida, req, TIMEOUT_RESPOSTA);
+        if (resp == null) return;
+
+        // Protocolo (EP-3): no sucesso vem apenas 'lista_usuarios'; o erro vem como 401.
+        JSONArray lista = resp.optJSONArray("lista_usuarios");
+        if (lista == null) return; // erro já exibido pelo ouvinte
+
+        if (lista.isEmpty()) {
+            System.out.println("[LOGADOS] Nenhum usuário online.");
+        } else {
+            System.out.println("[LOGADOS] " + lista.length() + " usuário(s) online:");
+            for (int i = 0; i < lista.length(); i++) {
+                System.out.println("   • " + lista.getString(i));
+            }
+        }
+    }
+
     // ═══ ENTREGA 2 — ÁREA ADMINISTRATIVA ════════════════════════════════════════
     // O administrador autentica fazendo login normal (admin/123456). O token de
     // sessão resultante — com role "adm" — é o que autoriza as operações de admin.
 
-    private void areaAdministrativa(Scanner scanner, PrintWriter saida, BufferedReader entrada) throws IOException {
+    private void areaAdministrativa(Scanner scanner, PrintWriter saida) {
         System.out.println("\n--- ÁREA ADMINISTRATIVA ---");
         System.out.print("Usuário: ");
         String usuario = scanner.nextLine().trim();
@@ -271,11 +357,10 @@ public class Cliente {
         login.put("op",      "login");
         login.put("usuario", usuario);
         login.put("senha",   senha);
-        enviarRequisicao(saida, login);
-        JSONObject resp = receberResposta(entrada);
+        JSONObject resp = enviarEAguardar(saida, login, TIMEOUT_RESPOSTA);
 
         if (resp == null || !"200".equals(resp.optString("resposta"))) {
-            return; // mensagem de falha já exibida por receberResposta
+            return; // mensagem de falha já exibida pelo ouvinte
         }
         String tokenAdmin = resp.getString("token");
         if (!"adm".equals(tokenAdmin)) {
@@ -284,18 +369,17 @@ public class Cliente {
         }
 
         try {
-            menuAdmin(scanner, tokenAdmin, saida, entrada);
+            menuAdmin(scanner, tokenAdmin, saida);
         } finally {
             // Encerra a sessão administrativa ao sair da área.
             JSONObject logout = new JSONObject();
             logout.put("op",    "logout");
             logout.put("token", tokenAdmin);
-            enviarRequisicao(saida, logout);
-            receberResposta(entrada);
+            enviarEAguardar(saida, logout, TIMEOUT_RESPOSTA);
         }
     }
 
-    private void menuAdmin(Scanner scanner, String tokenAdmin, PrintWriter saida, BufferedReader entrada) throws IOException {
+    private void menuAdmin(Scanner scanner, String tokenAdmin, PrintWriter saida) {
         while (true) {
             System.out.println("\n---=== Menu Admin ===---");
             System.out.println("| 1 - Listar todos usuários |");
@@ -307,10 +391,10 @@ public class Cliente {
             String opcao = scanner.nextLine().trim();
 
             switch (opcao) {
-                case "1": consultarUsuariosAdmin(tokenAdmin, saida, entrada);          break;
-                case "2": consultarUsuarioAdmin(scanner, tokenAdmin, saida, entrada);  break;
-                case "3": atualizarUsuarioAdmin(scanner, tokenAdmin, saida, entrada);  break;
-                case "4": deletarUsuarioAdmin(scanner, tokenAdmin, saida, entrada);    break;
+                case "1": consultarUsuariosAdmin(tokenAdmin, saida);          break;
+                case "2": consultarUsuarioAdmin(scanner, tokenAdmin, saida);  break;
+                case "3": atualizarUsuarioAdmin(scanner, tokenAdmin, saida);  break;
+                case "4": deletarUsuarioAdmin(scanner, tokenAdmin, saida);    break;
                 case "0": return;
                 default:  System.err.println("Opção inválida!");
             }
@@ -319,15 +403,14 @@ public class Cliente {
 
     // ─── ADM LIST ───────────────────────────────────────────────────────────────
 
-    private void consultarUsuariosAdmin(String tokenAdmin, PrintWriter saida, BufferedReader entrada) throws IOException {
+    private void consultarUsuariosAdmin(String tokenAdmin, PrintWriter saida) {
         System.out.println("\n--- LISTAR TODOS USUÁRIOS (ADM) ---");
 
         JSONObject req = new JSONObject();
         req.put("op",          "consultarUsuariosAdmin");
         req.put("token_admin", tokenAdmin);
 
-        enviarRequisicao(saida, req);
-        JSONObject resp = receberResposta(entrada);
+        JSONObject resp = enviarEAguardar(saida, req, TIMEOUT_RESPOSTA);
 
         if (resp != null && "200".equals(resp.optString("resposta"))) {
             JSONArray lista = resp.optJSONArray("lista_usuarios");
@@ -345,7 +428,7 @@ public class Cliente {
 
     // ─── ADM READ ─────────────────────────────────────────────────────────────
 
-    private void consultarUsuarioAdmin(Scanner scanner, String tokenAdmin, PrintWriter saida, BufferedReader entrada) throws IOException {
+    private void consultarUsuarioAdmin(Scanner scanner, String tokenAdmin, PrintWriter saida) {
         System.out.println("\n--- CONSULTAR USUÁRIO (ADM) ---");
         System.out.print("Usuário a consultar: ");
         String usuario = scanner.nextLine().trim();
@@ -355,8 +438,7 @@ public class Cliente {
         req.put("token_admin", tokenAdmin);
         req.put("usuario",     usuario);
 
-        enviarRequisicao(saida, req);
-        JSONObject resp = receberResposta(entrada);
+        JSONObject resp = enviarEAguardar(saida, req, TIMEOUT_RESPOSTA);
 
         if (resp != null && "200".equals(resp.optString("resposta"))) {
             System.out.println("[DADOS] Nome:    " + resp.optString("nome"));
@@ -366,7 +448,7 @@ public class Cliente {
 
     // ─── ADM UPDATE ─────────────────────────────────────────────────────────────
 
-    private void atualizarUsuarioAdmin(Scanner scanner, String tokenAdmin, PrintWriter saida, BufferedReader entrada) throws IOException {
+    private void atualizarUsuarioAdmin(Scanner scanner, String tokenAdmin, PrintWriter saida) {
         System.out.println("\n--- ATUALIZAR USUÁRIO (ADM) ---");
         System.out.print("Usuário a atualizar: ");
         String usuario = scanner.nextLine().trim();
@@ -386,13 +468,12 @@ public class Cliente {
         req.put("nome",  nome.isEmpty()  ? JSONObject.NULL : nome);
         req.put("senha", senha.isEmpty() ? JSONObject.NULL : senha);
 
-        enviarRequisicao(saida, req);
-        receberResposta(entrada);
+        enviarEAguardar(saida, req, TIMEOUT_RESPOSTA);
     }
 
     // ─── ADM DELETE ─────────────────────────────────────────────────────────────
 
-    private void deletarUsuarioAdmin(Scanner scanner, String tokenAdmin, PrintWriter saida, BufferedReader entrada) throws IOException {
+    private void deletarUsuarioAdmin(Scanner scanner, String tokenAdmin, PrintWriter saida) {
         System.out.println("\n--- DELETAR USUÁRIO (ADM) ---");
         System.out.print("Usuário a deletar: ");
         String usuario = scanner.nextLine().trim();
@@ -409,11 +490,73 @@ public class Cliente {
         req.put("token_admin", tokenAdmin);
         req.put("usuario",     usuario);
 
-        enviarRequisicao(saida, req);
-        receberResposta(entrada);
+        enviarEAguardar(saida, req, TIMEOUT_RESPOSTA);
     }
 
     // ─── AUXILIARES ───────────────────────────────────────────────────────────
+
+    // Ouvinte assíncrono: única thread que lê do socket. Diferencia o push de
+    // mensagem (S->C, op="receberMensagem") — exibido na hora — das respostas de
+    // comando, que são entregues a quem aguarda via o futuro 'pendente'.
+    private void escutarServidor(BufferedReader entrada) {
+        try {
+            String linha;
+            while ((linha = entrada.readLine()) != null) {
+                JSONObject json;
+                try {
+                    json = new JSONObject(linha);
+                } catch (Exception e) {
+                    System.err.println("[ERRO] Mensagem ininteligível do servidor: " + linha);
+                    continue;
+                }
+
+                // Push de mensagem (S->C): exibido imediatamente, não é resposta de comando.
+                if ("receberMensagem".equals(json.optString("op"))) {
+                    logRecebido(json);
+                    exibirMensagemRecebida(json);
+                    continue;
+                }
+
+                // Demais payloads são respostas a um comando: registra, interpreta e
+                // entrega ao solicitante (se houver algum aguardando).
+                logRecebido(json);
+                interpretar(json);
+                CompletableFuture<JSONObject> f = pendente.getAndSet(null);
+                if (f != null) {
+                    f.complete(json);
+                }
+            }
+        } catch (IOException e) {
+            // conexão encerrada
+        } finally {
+            conectado = false;
+            CompletableFuture<JSONObject> f = pendente.getAndSet(null);
+            if (f != null) f.complete(null);
+            System.err.println("\n[SISTEMA] Conexão com o servidor encerrada. Pressione ENTER para sair.");
+        }
+    }
+
+    // Envia uma requisição e bloqueia até a resposta correspondente chegar (ou o
+    // tempo esgotar). Usado pelas operações que esperam exatamente uma resposta.
+    private JSONObject enviarEAguardar(PrintWriter saida, JSONObject req, long timeoutMs) {
+        if (!conectado) {
+            System.err.println("[ERRO] Sem conexão com o servidor.");
+            return null;
+        }
+        CompletableFuture<JSONObject> futuro = new CompletableFuture<>();
+        pendente.set(futuro);
+        enviarRequisicao(saida, req);
+        try {
+            return futuro.get(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            pendente.compareAndSet(futuro, null);
+            System.err.println("[ERRO] O servidor não respondeu a tempo.");
+            return null;
+        } catch (Exception e) {
+            pendente.compareAndSet(futuro, null);
+            return null;
+        }
+    }
 
     // Log local + envio pela rede — payload contém apenas o que o protocolo define
     private void enviarRequisicao(PrintWriter saida, JSONObject req) {
@@ -423,44 +566,33 @@ public class Cliente {
         saida.println(req.toString());
     }
 
-    // Aguarda a resposta do servidor — uma única mensagem JSON conforme o protocolo
-    private JSONObject receberResposta(BufferedReader entrada) throws IOException {
-        String linha = entrada.readLine();
+    private void logRecebido(JSONObject json) {
+        System.out.println("\n[ RECEBIDO ← SERVIDOR ]");
+        System.out.println(json.toString(4));
+        System.out.println("==================================================");
+    }
 
-        if (linha == null) {
-            System.err.println("[ERRO] O servidor fechou a conexão de forma inesperada.");
-            return null;
+    private void exibirMensagemRecebida(JSONObject json) {
+        System.out.println("\n┌─── [ MENSAGEM RECEBIDA ] ───");
+        System.out.println("│ De: " + json.optString("remetente"));
+        System.out.println("│ " + json.optString("mensagem"));
+        System.out.println("└─────────────────────────────");
+    }
+
+    // Imprime [SUCESSO]/[FALHA] das respostas de comando. A listagem de logados é o
+    // único sucesso sem campo 'resposta' (conforme o protocolo) — nesse caso, silêncio.
+    private void interpretar(JSONObject json) {
+        if (!json.has("resposta")) {
+            return;
         }
-
-        try {
-            JSONObject json = new JSONObject(linha);
-
-            // Log local: imprime o que chegou pela rede
-            System.out.println("\n[ RECEBIDO ← SERVIDOR ]");
-            System.out.println(json.toString(4));
-            System.out.println("==================================================");
-
-            if (!json.has("resposta")) {
-                System.err.println("[ALERTA PROTOCOLO] Resposta sem campo 'resposta'.");
-                return null;
-            }
-
-            String codigo   = json.getString("resposta");
-            String mensagem = json.optString("mensagem", "");
-
-            if ("200".equals(codigo)) {
-                if (!mensagem.isEmpty()) System.out.println("[SUCESSO] " + mensagem);
-            } else if ("401".equals(codigo)) {
-                System.err.println("[FALHA] " + mensagem);
-            } else {
-                System.err.println("[ALERTA PROTOCOLO] Código desconhecido: " + codigo);
-            }
-
-            return json;
-
-        } catch (Exception e) {
-            System.err.println("[ERRO] Resposta ininteligível do servidor: " + linha);
-            return null;
+        String codigo   = json.getString("resposta");
+        String mensagem = json.optString("mensagem", "");
+        if ("200".equals(codigo)) {
+            if (!mensagem.isEmpty()) System.out.println("[SUCESSO] " + mensagem);
+        } else if ("401".equals(codigo)) {
+            System.err.println("[FALHA] " + mensagem);
+        } else {
+            System.err.println("[ALERTA PROTOCOLO] Código desconhecido: " + codigo);
         }
     }
 

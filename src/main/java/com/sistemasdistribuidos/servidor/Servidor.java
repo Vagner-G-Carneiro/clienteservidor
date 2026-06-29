@@ -31,7 +31,12 @@ public class Servidor {
     private static final class Sessao {
         final String usuario;
         final String ip;
-        Sessao(String usuario, String ip) { this.usuario = usuario; this.ip = ip; }
+        final PrintWriter saida; // canal de push (S->C) para entregar mensagens a este usuário
+        Sessao(String usuario, String ip, PrintWriter saida) {
+            this.usuario = usuario;
+            this.ip      = ip;
+            this.saida   = saida;
+        }
     }
 
     public Servidor(int porta) {
@@ -63,15 +68,17 @@ public class Servidor {
 
     private void lidarComCliente(Socket socket) {
         String ipCliente = socket.getInetAddress().getHostAddress();
-        try (BufferedReader entrada = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-            PrintWriter saida = new PrintWriter(socket.getOutputStream(), true)) {
+        PrintWriter saida = null;
+        try {
+            BufferedReader entrada = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+            saida = new PrintWriter(socket.getOutputStream(), true);
             System.out.println("[SISTEMA] Cliente conectado: " + ipCliente + ":" + socket.getPort());
             String linha;
             while ((linha = entrada.readLine()) != null) {
                 try {
                     JSONObject jsonRecebido = new JSONObject(linha);
 
-                    // Log local: imprime o que chegou pela rede — nada é transmitido de volta aqui
+                    // Log local: imprime o que chegou pela rede
                     System.out.println("\n[ RECEBIDO ← CLIENTE " + ipCliente + " ]");
                     System.out.println(jsonRecebido.toString(4));
                     System.out.println("--------------------------------------------------");
@@ -80,10 +87,24 @@ public class Servidor {
 
                 } catch (JSONException e) {
                     enviarErro(saida, "JSON malformado recebido.");
+                } catch (RuntimeException e) {
+                    // Blindagem: nenhuma falha ao processar UMA requisição pode derrubar
+                    // a thread do cliente — e muito menos o servidor.
+                    System.err.println("[ERRO] Falha ao processar requisição de " + ipCliente + ": " + e.getMessage());
+                    enviarErro(saida, "Erro interno ao processar a requisição.");
                 }
             }
         } catch (IOException e) {
             // Cliente desconectou
+        } finally {
+            // Fim da conexão: remove as sessões abertas por este cliente, mantendo a
+            // lista de usuários logados sempre atualizada (item h da rubrica EP-3).
+            if (saida != null) {
+                final PrintWriter ref = saida;
+                sessoes.values().removeIf(s -> s.saida == ref);
+            }
+            try { socket.close(); } catch (IOException ignored) {}
+            System.out.println("[SISTEMA] Cliente desconectado: " + ipCliente);
         }
     }
 
@@ -108,6 +129,10 @@ public class Servidor {
             case "consultarUsuarioAdmin":  consultarUsuarioAdmin(jsonRecebido, saida, ipCliente);  break;
             case "atualizarUsuarioAdmin":  atualizarUsuarioAdmin(jsonRecebido, saida, ipCliente);  break;
             case "deletarUsuarioAdmin":    deletarUsuarioAdmin(jsonRecebido, saida, ipCliente);    break;
+
+            // ── ENTREGA 3 — MENSAGENS ──
+            case "enviarMensagem":         enviarMensagem(jsonRecebido, saida, ipCliente);         break;
+            case "listarUsuariosLogados":  listarUsuariosLogados(jsonRecebido, saida, ipCliente);  break;
 
             default:                 enviarErro(saida, "Operação desconhecida: " + op);
         }
@@ -190,7 +215,7 @@ public class Servidor {
         // O servidor guarda o token E o IP — qualquer request com esse token vindo
         // de outro IP é tratada como fraude e rejeitada (itens i/j da rubrica).
         String token = usuario.equals(ADMIN_USUARIO) ? ROLE_ADMIN : (ROLE_USER + "_" + usuario);
-        sessoes.put(token, new Sessao(usuario, ipCliente));
+        sessoes.put(token, new Sessao(usuario, ipCliente, saida));
 
         JSONObject resp = new JSONObject();
         resp.put("resposta", "200");
@@ -414,7 +439,116 @@ public class Servidor {
         enviarJSON(saida, resp);
     }
 
+    // ═══ ENTREGA 3 — MENSAGENS ══════════════════════════════════════════════════
+
+    // ─── ENVIAR MENSAGEM (direta ou broadcast) ──────────────────────────────────
+
+    private void enviarMensagem(JSONObject dados, PrintWriter saida, String ipCliente) {
+        Sessao remetente = resolverSessao(dados, "token", saida, ipCliente);
+        if (remetente == null) return;
+
+        if (!dados.has("destinatario") || !dados.has("mensagem")) {
+            enviarErro(saida, "Campos obrigatórios ausentes: 'destinatario' e 'mensagem'.");
+            return;
+        }
+
+        String destinatario = dados.getString("destinatario").trim();
+        String mensagem      = dados.getString("mensagem");
+
+        if (destinatario.isEmpty() || mensagem.isEmpty()) {
+            enviarErro(saida, "Destinatário e mensagem devem estar preenchidos.");
+            return;
+        }
+
+        // Broadcast: o protocolo fixa o destinatário "/todos". Entrega a todos os
+        // usuários logados, menos o próprio remetente.
+        if (destinatario.equals("/todos")) {
+            for (Sessao s : sessoes.values()) {
+                if (!s.usuario.equals(remetente.usuario)) {
+                    empurrarMensagem(s, remetente.usuario, mensagem);
+                }
+            }
+            return;
+        }
+
+        // Mensagem direta: regra do protocolo — o destinatário precisa estar online.
+        Sessao alvo = buscarSessaoPorUsuario(destinatario);
+        if (alvo == null) {
+            enviarErro(saida, "Destinatário não está online.");
+            return;
+        }
+        empurrarMensagem(alvo, remetente.usuario, mensagem);
+    }
+
+    // ─── LISTAR USUÁRIOS LOGADOS ────────────────────────────────────────────────
+
+    private void listarUsuariosLogados(JSONObject dados, PrintWriter saida, String ipCliente) {
+        if (resolverSessao(dados, "token", saida, ipCliente) == null) return;
+
+        JSONArray lista = new JSONArray();
+        for (Sessao s : sessoes.values()) {
+            lista.put(s.usuario);
+        }
+
+        // Protocolo (EP-3): no sucesso a resposta traz APENAS 'lista_usuarios',
+        // sem o campo 'resposta'. Respeitado à risca.
+        JSONObject resp = new JSONObject();
+        resp.put("lista_usuarios", lista);
+        enviarJSON(saida, resp);
+    }
+
+    // ─── PUSH (S->C): entrega de mensagem ao destinatário ───────────────────────
+
+    private void empurrarMensagem(Sessao alvo, String remetente, String mensagem) {
+        JSONObject push = new JSONObject();
+        push.put("op",        "receberMensagem");
+        push.put("remetente", remetente);
+        push.put("mensagem",  mensagem);
+
+        System.out.println("\n[ ENVIADO → CLIENTE " + alvo.usuario + " ] (push)");
+        System.out.println(push.toString(4));
+        System.out.println("==================================================");
+        // println do PrintWriter é atômico por linha; seguro mesmo se a thread do
+        // próprio destinatário estiver escrevendo nele ao mesmo tempo.
+        alvo.saida.println(push.toString());
+    }
+
+    private Sessao buscarSessaoPorUsuario(String usuario) {
+        for (Sessao s : sessoes.values()) {
+            if (s.usuario.equals(usuario)) return s;
+        }
+        return null;
+    }
+
     // ─── AUXILIARES ───────────────────────────────────────────────────────────
+
+    // Resolve o token informado (nome do campo varia conforme a operação) para uma
+    // sessão ativa, validando presença, existência e o vínculo token↔IP (defesa
+    // anti-fraude). Aceita qualquer sessão ativa — comum ou admin — pois a troca de
+    // mensagens vale para todos os usuários logados.
+    private Sessao resolverSessao(JSONObject dados, String campo, PrintWriter saida, String ipCliente) {
+        if (!dados.has(campo) || dados.isNull(campo)) {
+            enviarErro(saida, "Campo obrigatório ausente: '" + campo + "'.");
+            return null;
+        }
+        String token = dados.getString(campo).trim();
+        if (token.isEmpty()) {
+            enviarErro(saida, "O campo '" + campo + "' não pode estar vazio.");
+            return null;
+        }
+        Sessao sessao = sessoes.get(token);
+        if (sessao == null) {
+            enviarErro(saida, "Token inválido.");
+            return null;
+        }
+        if (!sessao.ip.equals(ipCliente)) {
+            System.out.println("[ALERTA] Fraude: token '" + token + "' usado por IP "
+                    + ipCliente + " (sessão registrada em " + sessao.ip + ")");
+            enviarErro(saida, "Token inválido.");
+            return null;
+        }
+        return sessao;
+    }
 
     // Autoriza operações de administrador. O admin se autentica via login normal
     // (admin/123456) e usa o token de sessão resultante. Só é admin quem possui
