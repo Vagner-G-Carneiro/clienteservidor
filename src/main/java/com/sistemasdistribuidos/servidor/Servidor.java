@@ -10,10 +10,27 @@ import java.io.InputStreamReader;
 import java.io.PrintWriter;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class Servidor {
+
+    // Permite que a interface gráfica (ou o console) acompanhe o servidor sem
+    // acoplar o motor de rede a nenhuma tela. As chamadas vêm de threads do
+    // servidor; quem implementa é responsável por marshalling para a thread de UI.
+    public interface Ouvinte {
+        void log(String linha);
+        void sessoesAtualizadas(List<String> usuariosLogados);
+    }
+
+    // Ouvinte padrão para execução headless (sem GUI): apenas console.
+    private static final Ouvinte CONSOLE = new Ouvinte() {
+        @Override public void log(String linha) { System.out.println(linha); }
+        @Override public void sessoesAtualizadas(List<String> usuarios) { }
+    };
 
     // Conta de administrador padrão — sempre disponível, login fixo admin/123456.
     private static final String ADMIN_USUARIO = "admin";
@@ -23,15 +40,20 @@ public class Servidor {
     private static final String ROLE_ADMIN = "adm";  // sessão de administrador
 
     private final int porta;
+    private final Ouvinte ouvinte;
+    private volatile ServerSocket serverSocket;
+    private volatile boolean rodando = false;
+
     private final Map<String, JSONObject> bancoUsuarios = new ConcurrentHashMap<>();
     private final Map<String, Sessao>     sessoes       = new ConcurrentHashMap<>(); // token → sessão (usuário + IP)
 
     // Sessão amarra o token ao IP do cliente que efetuou o login — detecta fraude
-    // quando outro IP tenta reusar o token (itens i/j da rubrica de avaliação).
+    // quando outro IP tenta reusar o token (itens i/j da rubrica de avaliação) — e
+    // guarda o canal de saída para empurrar mensagens a este usuário (Entrega 3).
     private static final class Sessao {
         final String usuario;
         final String ip;
-        final PrintWriter saida; // canal de push (S->C) para entregar mensagens a este usuário
+        final PrintWriter saida;
         Sessao(String usuario, String ip, PrintWriter saida) {
             this.usuario = usuario;
             this.ip      = ip;
@@ -40,8 +62,17 @@ public class Servidor {
     }
 
     public Servidor(int porta) {
-        this.porta = porta;
+        this(porta, CONSOLE);
+    }
+
+    public Servidor(int porta, Ouvinte ouvinte) {
+        this.porta   = porta;
+        this.ouvinte = ouvinte;
         semearAdmin();
+    }
+
+    public boolean isRodando() {
+        return rodando;
     }
 
     // Garante que a conta de administrador exista desde a inicialização.
@@ -54,15 +85,31 @@ public class Servidor {
     }
 
     public void iniciar() {
-        System.out.println("[SISTEMA] Servidor aguardando conexões na porta " + porta + "...\n");
+        rodando = true;
+        log("[SISTEMA] Servidor aguardando conexões na porta " + porta + "...");
 
-        try (ServerSocket serverSocket = new ServerSocket(porta)) {
-            while (true) {
-                Socket socket = serverSocket.accept();
+        try (ServerSocket ss = new ServerSocket(porta)) {
+            this.serverSocket = ss;
+            notificarSessoes(); // estado inicial (vazio) para a GUI
+            while (rodando) {
+                Socket socket = ss.accept();
                 new Thread(() -> lidarComCliente(socket)).start();
             }
         } catch (IOException e) {
-            System.err.println("[ERRO CRÍTICO] " + e.getMessage());
+            if (rodando) log("[ERRO CRÍTICO] " + e.getMessage());
+        } finally {
+            rodando = false;
+            serverSocket = null;
+            log("[SISTEMA] Servidor parado.");
+        }
+    }
+
+    // Encerra o laço de aceitação: fecha o ServerSocket para destravar o accept().
+    public void parar() {
+        rodando = false;
+        ServerSocket ss = serverSocket;
+        if (ss != null) {
+            try { ss.close(); } catch (IOException ignored) { }
         }
     }
 
@@ -72,16 +119,15 @@ public class Servidor {
         try {
             BufferedReader entrada = new BufferedReader(new InputStreamReader(socket.getInputStream()));
             saida = new PrintWriter(socket.getOutputStream(), true);
-            System.out.println("[SISTEMA] Cliente conectado: " + ipCliente + ":" + socket.getPort());
+            log("[SISTEMA] Cliente conectado: " + ipCliente + ":" + socket.getPort());
             String linha;
             while ((linha = entrada.readLine()) != null) {
                 try {
                     JSONObject jsonRecebido = new JSONObject(linha);
 
-                    // Log local: imprime o que chegou pela rede
-                    System.out.println("\n[ RECEBIDO ← CLIENTE " + ipCliente + " ]");
-                    System.out.println(jsonRecebido.toString(4));
-                    System.out.println("--------------------------------------------------");
+                    log("\n[ RECEBIDO ← CLIENTE " + ipCliente + " ]\n"
+                            + jsonRecebido.toString(4)
+                            + "\n--------------------------------------------------");
 
                     processarRequisicao(jsonRecebido, saida, ipCliente);
 
@@ -90,7 +136,7 @@ public class Servidor {
                 } catch (RuntimeException e) {
                     // Blindagem: nenhuma falha ao processar UMA requisição pode derrubar
                     // a thread do cliente — e muito menos o servidor.
-                    System.err.println("[ERRO] Falha ao processar requisição de " + ipCliente + ": " + e.getMessage());
+                    log("[ERRO] Falha ao processar requisição de " + ipCliente + ": " + e.getMessage());
                     enviarErro(saida, "Erro interno ao processar a requisição.");
                 }
             }
@@ -102,9 +148,10 @@ public class Servidor {
             if (saida != null) {
                 final PrintWriter ref = saida;
                 sessoes.values().removeIf(s -> s.saida == ref);
+                notificarSessoes();
             }
-            try { socket.close(); } catch (IOException ignored) {}
-            System.out.println("[SISTEMA] Cliente desconectado: " + ipCliente);
+            try { socket.close(); } catch (IOException ignored) { }
+            log("[SISTEMA] Cliente desconectado: " + ipCliente);
         }
     }
 
@@ -216,6 +263,7 @@ public class Servidor {
         // de outro IP é tratada como fraude e rejeitada (itens i/j da rubrica).
         String token = usuario.equals(ADMIN_USUARIO) ? ROLE_ADMIN : (ROLE_USER + "_" + usuario);
         sessoes.put(token, new Sessao(usuario, ipCliente, saida));
+        notificarSessoes();
 
         JSONObject resp = new JSONObject();
         resp.put("resposta", "200");
@@ -243,6 +291,7 @@ public class Servidor {
         }
 
         sessoes.remove(token);
+        notificarSessoes();
 
         JSONObject resp = new JSONObject();
         resp.put("resposta", "200");
@@ -307,6 +356,7 @@ public class Servidor {
         String token = dados.getString("token").trim();
         sessoes.remove(token);
         bancoUsuarios.remove(usuario);
+        notificarSessoes();
 
         JSONObject resp = new JSONObject();
         resp.put("resposta", "200");
@@ -432,6 +482,7 @@ public class Servidor {
 
         bancoUsuarios.remove(usuario);
         sessoes.values().removeIf(s -> s.usuario.equals(usuario)); // encerra sessões ativas do usuário removido
+        notificarSessoes();
 
         JSONObject resp = new JSONObject();
         resp.put("resposta", "200");
@@ -505,9 +556,9 @@ public class Servidor {
         push.put("remetente", remetente);
         push.put("mensagem",  mensagem);
 
-        System.out.println("\n[ ENVIADO → CLIENTE " + alvo.usuario + " ] (push)");
-        System.out.println(push.toString(4));
-        System.out.println("==================================================");
+        log("\n[ ENVIADO → CLIENTE " + alvo.usuario + " ] (push)\n"
+                + push.toString(4)
+                + "\n==================================================");
         // println do PrintWriter é atômico por linha; seguro mesmo se a thread do
         // próprio destinatário estiver escrevendo nele ao mesmo tempo.
         alvo.saida.println(push.toString());
@@ -542,7 +593,7 @@ public class Servidor {
             return null;
         }
         if (!sessao.ip.equals(ipCliente)) {
-            System.out.println("[ALERTA] Fraude: token '" + token + "' usado por IP "
+            log("[ALERTA] Fraude: token '" + token + "' usado por IP "
                     + ipCliente + " (sessão registrada em " + sessao.ip + ")");
             enviarErro(saida, "Token inválido.");
             return null;
@@ -567,7 +618,7 @@ public class Servidor {
         }
         // Token amarrado ao IP de login — outro IP usando o mesmo token = fraude.
         if (!sessao.ip.equals(ipCliente)) {
-            System.out.println("[ALERTA] Fraude: token_admin '" + token + "' usado por IP "
+            log("[ALERTA] Fraude: token_admin '" + token + "' usado por IP "
                     + ipCliente + " (sessão registrada em " + sessao.ip + ")");
             enviarErro(saida, msgErro);
             return false;
@@ -623,7 +674,7 @@ public class Servidor {
         // Itens i/j da rubrica: "Servidor não permite que usuário comum consiga
         // editar/apagar dados que não seus".
         if (!sessao.ip.equals(ipCliente)) {
-            System.out.println("[ALERTA] Fraude: token '" + token + "' usado por IP "
+            log("[ALERTA] Fraude: token '" + token + "' usado por IP "
                     + ipCliente + " (sessão registrada em " + sessao.ip + ")");
             enviarErro(saida, "Token inválido.");
             return null;
@@ -634,9 +685,9 @@ public class Servidor {
 
     // Log local + envio pela rede — payload contém apenas o que o protocolo define
     private void enviarJSON(PrintWriter saida, JSONObject json) {
-        System.out.println("\n[ ENVIADO → CLIENTE ]");
-        System.out.println(json.toString(4));
-        System.out.println("==================================================");
+        log("\n[ ENVIADO → CLIENTE ]\n"
+                + json.toString(4)
+                + "\n==================================================");
         saida.println(json.toString());
     }
 
@@ -647,7 +698,20 @@ public class Servidor {
         enviarJSON(saida, erro);
     }
 
+    private void log(String linha) {
+        ouvinte.log(linha);
+    }
+
+    private void notificarSessoes() {
+        List<String> usuarios = new ArrayList<>();
+        for (Sessao s : sessoes.values()) usuarios.add(s.usuario);
+        Collections.sort(usuarios);
+        ouvinte.sessoesAtualizadas(usuarios);
+    }
+
+    // Execução headless (sem GUI): java ... Servidor [porta]
     public static void main(String[] args) {
-        new Servidor(21111).iniciar();
+        int porta = args.length > 0 ? Integer.parseInt(args[0]) : 21111;
+        new Servidor(porta).iniciar();
     }
 }
